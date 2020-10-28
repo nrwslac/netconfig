@@ -1,0 +1,1641 @@
+#!/usr/bin/python
+# This script add a host on the lab network
+# It will add the host in the LDAP database, assign it an IP
+# address and make sure all the network services know about
+# the new node.
+#
+# Copyright 2008, Stanford University
+# Author: Remi Machet <rmachet@slac.stanford.edu>
+#
+# Released under the GPLv2 licence <http://www.gnu.org/licenses/gpl-2.0.html>
+#
+
+import sys
+import ldap
+import ldap.sasl
+import ldapurl
+import re
+import os
+import getpass
+import traceback
+import glob
+sys.path.append(os.path.dirname(sys.argv[0]) + "/../lib")
+import pyslac
+import time
+import smtplib
+import socket
+
+LDAP_USER="ldap-hosts-update"
+LDAP_KEY_FILE=LDAP_USER + ".md5key"
+#SUBNET_DHCP_SERVER="epicssrv01"
+USE_RHEL7_SERVER=False
+MY_HOSTNAME=socket.gethostname()
+if MY_HOSTNAME=="psnetsrv01" or \
+   MY_HOSTNAME=="psnetsrv02":
+    USE_RHEL7_SERVER=True
+
+ldapDatabase = None
+
+def usage():
+    print "\n", \
+        sys.argv[0], ": add a node to the lab network.\n", \
+        "You must run this script BEFORE connecting the new node on the network.\n", \
+        "\nSyntax:", sys.argv[0], " \\\n", \
+        "\tview <hostname> [ --subnet <subnet_name> ] [ --brief ] \\\n", \
+        "\tsearch <pattern> [ --subnet <subnet_name> ] [ --brief ] \\\n", \
+        "\tadd [ <hostname> ] \\\n", \
+        "\t\t[ --mac <mac_address> ] [ --ip <ip_address> ] \\\n", \
+        "\t\t[ --alias <alias> [ --alias <alias> ... ]] \\\n", \
+        "\t\t[ --add-alias <alias> ] \\\n", \
+        "\t\t[ --delete-alias <alias> ] \\\n", \
+        "\t\t[ --cname <cname> [ --cname <cname> ... ]] \\\n", \
+        "\t\t[ --add-cname <cname> ] \\\n", \
+        "\t\t[ --delete-cname <cname> ] \\\n", \
+        "\t\t[ --dhcp-default-lease <def_time> ] \\\n", \
+        "\t\t[ --dhcp-max-lease <max_time> ] \\\n", \
+        "\t\t[ --dhcpopt <quoted_string> [ --dhcpopt <quoted_string> ]] \\\n", \
+        "\t\t[ --puppetclass <string> [ --puppetclass <string> ]] \\\n", \
+        "\t\t[ --pc <SLAC Property Control Number> ] \\\n", \
+        "\t\t[ --location <Physical Location> ] \\\n", \
+        "\t\t[ --manager <username> ] [ --info <info_string> ] \\\n", \
+        "\t\t[ --subnet <subnet_name> ] \\\n", \
+        "\t\t[ --console <console> ] [ --power <power_outlet> ] \\\n", \
+        "\tedit [ <hostname> ] \\\n", \
+        "\t\t[ --mac <mac_address> ] [ --ip <ip_address> ] \\\n", \
+        "\t\t[ --dhcp-default-lease <def_time> ] \\\n", \
+        "\t\t[ --dhcp-max-lease <max_time> ] \\\n", \
+        "\t\t[ --dhcpopt <quoted_string> [ --dhcpopt <quoted_string> ]] \\\n", \
+        "\t\t[ --delete-dhcpopt <quoted_string>] \\\n", \
+        "\t\t[ --puppetclass <string> [ --puppetclass <string> ]] \\\n", \
+        "\t\t[ --add-puppetclass <puppetclass> ] \\\n", \
+        "\t\t[ --pc <SLAC Property Control Number> ] \\\n", \
+        "\t\t[ --location <Physical Location> ] \\\n", \
+        "\t\t[ --delete-puppetclass <puppetclass> ] \\\n", \
+        "\t\t[ --manager <username> ] [ --info <info_string> ] \\\n", \
+        "\t\t[ --monitgroup <monitgroup> [ --monitgroup <monitgroup> ... ]] \\\n", \
+        "\t\t[ --subnet <subnet_name> ] \\\n", \
+        "\t\t[ --console <console> ] [ --power <power_outlet> ] \\\n", \
+        "\t\t[ --new-node-name <hostname> ] \\\n", \
+        "\tdel <hostname1> <hostname2> ... [ --subnet <subnet_name> ] \\\n", \
+        "\t[ --noask ] [ --noprompt ] [ --batch ]\\\n", \
+        "\t[ --debug ] [ --norestart ] [ --noemail ]\\\n", \
+        "\t--help or -h\n\n", \
+        "view: display the configuration of a host.\n", \
+        "search: display the list of nodes that match <pattern> (any field).\n", \
+        "\tNote: you can use wildcards on 'string' fields only!\n", \
+        "add: add a new node, all necessary info can be specified on the command\n", \
+        "\tline, otherwise the script will ask you to enter them.\n", \
+        "edit: edit a node. All info specified on the command line will be edited.\n", \
+        "del: remove one or multiple nodes and free their associated ressources.\n", \
+        "<hostname>: name of the host to add, edit or remove.\n", \
+        "--cname <cname>: any other DNS name you want this host to be recognized under.\n", \
+        "\tThere can be as many as you want (beware of naming conflicts !)\n", \
+        "\tEach cnames must be preceeded by an --cname switch.\n", \
+        "--add-cname <cname>: Add a new cname to a node.\n", \
+        "--alias <alias>: any unofficial name you want this host to be recognized under.\n", \
+        "\tThere can be as many as you want (beware of naming conflicts !)\n", \
+        "\tEach aliases must be preceeded by an --alias switch.\n", \
+        "--add-alias <alias>: Add a new alias to a node.\n", \
+        "--add-puppetclass <puppetclass>: add host to a Puppet Class.\n", \
+        "--batch: If set interactive mode is disabled.\n", \
+        "--brief: If set, view and search will only show hostname.\n", \
+        "\tconfig files and restart services.\n", \
+        "--console <console>: terminal server port to which this node console is\n", \
+        "\tconnected. <console> should be <terminal_server>:<port#>.\n", \
+        "--debug: Report more info when something goes wrong.\n", \
+        "\tTo be use in the edit mode only. Ignored in add mode.\n", \
+        "--delete-alias <alias>: Delete an alias from a node.\n", \
+        "--delete-cname <cname>: Delete an cname from a node.\n", \
+        "--delete-puppetclass <puppetclass>: delete host from a Puppet Class.\n", \
+        "--dhcp-default-lease <def_time>: default lease time.\n", \
+        "--dhcp-max-lease <max_time>: maximum lease time.\n", \
+        "--dhcpopt <quoted_string>: string to give to the DHCP server for\n", \
+        "--delete-dhcpopt <quoted_string>: delete DHCP option\n", \
+        "--ip <ip_address>: IP address of the node.\n", \
+        "--info <info_string>: description of the host.\n", \
+        "--manager <username>: user responsible for this host. This user must be\n", \
+        "--monitgroup <monitgroup>: Monit Group used for ping and ssh checks\n", \
+        "--noask: If set interactive mode is disabled.\n", \
+        "--noemail: To prevent email from being sent to the admins.\n", \
+        "--norestart: Only modify the LDAP database, does not re-generate\n", \
+        "--noprompt: If set interactive mode is disabled.\n", \
+        "\tknown of the LDAP database.\n", \
+        "--power <power_outlet>: controllable power outlet to which this node is\n", \
+        "\tconnected. <power_outlet> should be <power_outlet>:<outlet#>.\n", \
+        "--puppetclass <puppetclass>: Puppet Class to add a host to.\n", \
+        "\tThis switch is used if the host is not alrady in any class\n", \
+        "\tOtherwise, --add-puppetclass shoould be used.\n", \
+        "\tCan be used multiple times.\n", \
+        "\tEach Puppet Classes  must be preceeded by a --puppetclass switch.\n", \
+        "--subnet <subnet_name>: subnet name\n", \
+        "\tif you don't know on which network your host should be,\n", \
+        "\tcontact bhill or perazzo.\n", \
+        "--help or -h: Display this message.\n"    
+
+def anyDuplicate(thelist):
+    seen = set()
+    for x in thelist:
+        if x.lower() in seen: return True
+        seen.add(x.lower())
+    return False
+
+def isValidHostname(hostname):
+    if len(hostname) > 255:
+        return False
+    if hostname[0].isdigit(): return False
+    if hostname[-1:] == ".":
+        hostname = hostname[:-1] # strip exactly one dot from the right, if present
+    allowed = re.compile("(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
+    return allowed.match(hostname)
+
+def notify_admin(strNodeName, action, strOther):
+    adminEmail = "pcds-it-l@slac.stanford.edu"
+
+    if bDebug:
+        print ("adminEmail:%s\n") % adminEmail
+    try:
+        strFrom = "root@slac.stanford.edu"
+        strMsg = "From: %s\n" % (strFrom)
+        strMsg += "To: %s\n" % (adminEmail)
+        if action == "add":
+            strSubject = "Netconfig Update: Node added"
+        if action == "rename":
+            strSubject = "Netconfig Update: Node renamed"
+        if action == "del":
+            strSubject = "Netconfig Update: Node deleted"
+        strMsg += "Subject: %s\n" % (strSubject)
+        strMsg += "\n"
+        if action == "add":
+            strMsg += "A new node \"%s\" has been added by user %s.\n\n" % (strNodeName,getpass.getuser())
+        if action == "rename":
+            strMsg += "The node \"%s\" has been renamed to \"%s\" by user %s.\n\n" % (strOther,strNodeName,getpass.getuser())
+        if action == "del":
+            strMsg += "The node \"%s\" has been removed by user %s.\n\n" % (strNodeName,getpass.getuser())
+        if bDebug:
+            print ("%s\n") % strMsg
+        server = smtplib.SMTP("psmail.pcdsn")
+        server.sendmail(strFrom, adminEmail, strMsg)
+        server.quit()
+    except:
+        return 0
+        #raise
+        #return -1
+    return 0
+
+
+def list_subnet(ldapDatabase, base):
+        """Display a list of subnet on that network"""
+        base="ou=Subnets," + base
+        lstSubnets = []
+        try:
+                lst = ldapDatabase.get_dn_by_attribute([("objectClass","subnetObject")],base)
+                for subnet in lst:
+			subnetobj = pyslac.ldapAccess.ldapObject(ldapDatabase, subnet)
+                        lstSubnets.append(subnetobj.get_attr("dc")[0])
+                return lstSubnets
+        except:
+                return []
+
+# Return a negative number if the parameter is not a valid subnet
+def check_subnet(ldapDatabase, base, subnet):
+	base="ou=Subnets," + base
+	try:
+	        dn = ldapDatabase.get_dn_by_attribute([("dc",subnet.lower())], "ou=Subnets," + ldapDatabase.get_dnbase())[0]
+		return dn
+	except:
+		return None	
+
+# Extract the subnet from a dn
+def dnExtractSubnet( dn ):
+	s = re.search( "dc=([^,]+)", dn )
+	if s == None:
+		strSubnet = "???"
+	else:
+		strSubnet = s.expand(r"\1").lower()
+	return strSubnet
+
+# Return a negative number if the parameter is not a valid MAC address
+def check_etheraddr(ether_addr):
+	ether_list=ether_addr.split(":")
+	regex = re.compile("^[0-9a-fA-F][0-9a-fA-F]?$")
+	# Check that we have 6 numbers
+	if len(ether_list) != 6:
+		return -1
+	# Make sure every element is an hex value
+	for elem in ether_list:
+		if not regex.match(elem):
+			return -2
+	return 0
+
+def get_subnet(ldapDatabase, base, subnet):
+	base="ou=Subnets," + base
+	try:
+                subnetdn = ldapDatabase.get_dn_by_attribute([("objectClass","subnetObject"),("dc",subnet.lower())], base)[0]
+                subnetobj = pyslac.ldapAccess.ldapObject(ldapDatabase, subnetdn) 
+		return (subnetobj.get_attr("ipNetworkNumber")[0], subnetobj.get_attr("ipNetmaskNumber")[0])
+	except:
+		print "get_subnet(): Unexpected error:", sys.exc_info()[0]
+		return (None, None)	
+
+def find_alias(ldapDatabase, base, alias, subnet=None):
+	base="ou=Subnets," + base
+	if subnet != None:
+		base = "dc=" + subnet + "," + base
+	try:
+		dn = ldapDatabase.search_s([("objectClass","hostObject"),("cn",alias)], base)
+		if len(dn) == 0:
+			dn = ldapDatabase.search_s([("objectClass","hostObject"),("alias",alias)], base)
+			if len(dn) == 0:
+				raise
+		return dn[0][0]
+	except:
+		return None
+
+def find_cname(ldapDatabase, base, cname, subnet=None):
+	base="ou=Subnets," + base
+	if subnet != None:
+		base = "dc=" + subnet + "," + base
+	try:
+		dn = ldapDatabase.search_s([("objectClass","hostObject"),("cn",cname)], base)
+		if len(dn) == 0:
+			dn = ldapDatabase.search_s([("objectClass","hostObject"),("cname",cname)], base)
+			if len(dn) == 0:
+				raise
+		return dn[0][0]
+	except:
+		return None
+
+def find_all(ldapDatabase, base, strFind, subnet=None):
+	base="ou=Subnets," + base
+	if subnet != None:
+		base = "dc=" + subnet + "," + base
+	try:
+		lst_dnattr = ldapDatabase.search_any_host([  ("cn",strFind),\
+							("cname",strFind),\
+							("alias",strFind),\
+							("macAddress",strFind),\
+							("ipHostNumber",strFind),\
+							("description",strFind),\
+							("manager",strFind),\
+							("monitgroup",strFind),\
+							("console",strFind),\
+							("powerplug",strFind),\
+							("pcNumber",strFind),\
+							("location",strFind),\
+							("dhcp-default-lease-time",strFind),\
+							("dhcp-max-lease-time",strFind),\
+							("dhcp-statement",strFind)],\
+							base,ldap.SCOPE_SUBTREE)
+		return lst_dnattr
+	except:
+		return None
+
+def find_ethaddr(ldapDatabase, base, mac):
+	base="ou=Subnets," + base
+	try:
+		dn = ldapDatabase.get_dn_by_attribute([("objectClass","hostObject"),("macAddress",mac)],base)[0]
+		return dn
+	except:
+		return None
+
+def find_user(ldapDatabase, base, user):
+	base="ou=People," + base
+	try:
+		dn = ldapDatabase.get_dn_by_attribute([("objectClass","account"),("uid",user)],base)[0]
+		return dn
+	except:
+		return None
+
+def find_ipaddr(ldapDatabase, base, ip):
+	base="ou=Subnets," + base
+	try:
+		dn = ldapDatabase.get_dn_by_attribute([("objectClass","hostObject"),("ipHostNumber",ip)],base)[0]
+		return dn
+	except:
+		return None
+
+def find_terminal(ldapDatabase, base, strSimpleName):
+	"""From <terminal>:<port> returns the LDAP address of the terminal server port"""
+	try:
+		(strHost, strPort) = strSimpleName.split(":")
+		dnTermSrv = find_cname(ldapDatabase, base, strHost)
+		if dnTermSrv == None:
+			return None
+		dnPort = ldapDatabase.search_s([("objectClass","serialPortObject"),("port",strPort)],dnTermSrv,ldap.SCOPE_ONELEVEL)[0][0]
+		return dnPort
+	except:
+	        print "find_terminal(): Unexpected error:", sys.exc_info()[0]
+		return None
+
+def get_console(ldapDatabase, base, dnTerminalPort):
+	"""From the terminal server port return the console it is connnected to"""
+	try:
+		attr = ldapDatabase.search_s([("objectClass","serialPortObject")],base,ldap.SCOPE_BASE)[0][1]
+		if attr.has_key("link"):
+			return attr["link"][0]
+	except:
+		pass
+	return None
+
+def find_outlet(ldapDatabase, base, strSimpleName):
+	"""From <outlet>:<port> returns the LDAP address of the power outlet plug"""
+	try:
+		(strHost, strOutlet) = strSimpleName.split(":")
+		dnPowerOutlet = find_cname(ldapDatabase, base, strHost)
+		if dnPowerOutlet == None:
+			return None
+		dnPlug = ldapDatabase.search_s([("objectClass","powerOutletObject"),("outlet",strOutlet)],dnPowerOutlet,ldap.SCOPE_ONELEVEL)[0][0]
+		return dnPlug
+	except:
+		return None
+
+def get_outlet(ldapDatabase, base, dnPowerOutlet):
+	"""From the power outlet plug return the equipment it is connnected to"""
+	try:
+		attr = ldapDatabase.search_s([("objectClass","powerOutletObject")],dnPowerOutlet,ldap.SCOPE_BASE)[0][1]
+		if attr.has_key("powerplug"):
+			return attr["powerplug"][0]
+	except:
+		pass
+	return None
+
+def del_console_port(ldapDatabase, base, dnNode):
+       try:
+           print "dnNode %s"%dnNode
+           portdn = ldapDatabase.get_dn_by_attribute([("objectClass","serialPortObject"),("link",dnNode)],base)
+	   print "portdn: %s" %portdn
+	   if portdn:
+               portobj = pyslac.ldapAccess.ldapObject(ldapDatabase, portdn[0]) 
+	       portobj.del_attr("link")
+       except:
+	   print "del_console_port(): Unexpected error:", sys.exc_info()[0]
+	   raise
+       return 0
+
+def del_power_outlet(ldapDatabase, base, dnNode):
+       try:
+           outletdn = ldapDatabase.get_dn_by_attribute([("objectClass","powerOutletObject"),("powerplug",dnNode)],base)
+	   if outletdn:
+               outletobj = pyslac.ldapAccess.ldapObject(ldapDatabase, outletdn[0]) 
+	       outletobj.del_attr("powerplug")
+	
+       except:
+	   raise
+       return 0
+
+def add_console_port(ldapDatabase, dnConsole, dnNode):
+       try:
+           portobj = pyslac.ldapAccess.ldapObject(ldapDatabase, dnConsole) 
+           if portobj.get_attr("link"): 
+	       portobj.set_attr("link",dnNode)
+           else:
+               portobj.add_attr("link",dnNode)
+       except:
+	   raise
+       return 0
+
+def add_power_outlet(ldapDatabase, dnPowerOutlet, dnNode):
+       try:
+           outletobj = pyslac.ldapAccess.ldapObject(ldapDatabase, dnPowerOutlet) 
+           if outletobj.get_attr("powerplug"): 
+	       outletobj.set_attr("powerplug",dnNode)
+           else:
+               outletobj.add_attr("powerplug",dnNode)
+       except:
+	   raise
+       return 0
+
+def connect_console(ldapDatabase, base, dnNode, dnAddTerminalServerPort = None, dnDelTerminalServerPort = None):
+	"""Connect/Disconnect a terminal server port to a node
+	this API only affects the terminal server port, not the node"""
+	try:
+		if dnDelTerminalServerPort != None:
+			attr = ldapDatabase.search_s([("objectClass","serialPortObject")],dnDelTerminalServerPort,ldap.SCOPE_BASE)[0][1]
+			if attr.has_key("link"):
+				if attr["link"][0] != dnNode:
+					raise RuntimeError, "%s not linked to node %s" % (dnDelTerminalServerPort, dnNode)
+		if dnAddTerminalServerPort != None:
+			if attr.has_key("link"):
+				print "dummy"
+			else:
+				print "dummy"
+	except:
+		raise
+	return 0
+
+def connect_power(ldapDatabase, base, dnNode, dnAddPowerOutlet = None, dnDelPowerOutlet = None):
+	"""Connect/Disconnect a power outlet to a node
+	this API only affects the power outlet, not the node"""
+	try:
+		if dnDelPowerOutlet != None:
+			if attr.has_key("powerplug"):
+				if attr["powerplug"][0] != dnNode:
+					raise RuntimeError, "%s not linked to node %s" % (dnDelPowerOutlet, dnNode)
+		if dnAddPowerOutlet != None:
+			if attr.has_key("powerplug"):
+				print "dummy"
+			else:   
+				print "dummy"
+	except:
+		raise
+	return 0
+
+def del_node(ldapDatabase, base, node, subnet=None):
+    dn=find_cname(ldapDatabase, base, node, subnet)
+    if dn == None:
+        raise RuntimeError, "host %s not found" % (node)
+    del_console_port(ldapDatabase, base, dn)
+    del_power_outlet(ldapDatabase, base, dn)
+    ldapDatabase.delete_ldapObject(dn)	
+    if not bNoEmail:
+        notify_admin(node,"del","")
+    return 0
+
+# Add a new node into the LDAP database
+# This API first check all the arguments
+# If needed assign an IP address
+# Finally add the entry into the directory
+def add_node(ldapDatabase, base, strNodeName, strSubnet, lstAliases, lstCnames, strIPAddress, strMACAddress, strInfo, dnManager, \
+		dnConsole, dnPowerOutlet, dhcpInfo, puppetClass, strPCNumber, strLocation, lstMonitGroup ):
+
+    # Build the LDAP request
+    if bDebug:
+        print "in add_node"
+    dn = "cn=" + strNodeName + ",dc=" + strSubnet + ",ou=Subnets," + base
+    addlist=[]
+    addlist.append(("objectClass", "hostObject"))
+    if len(lstCnames) != 0:
+        addlist.append(("cname", lstCnames))
+    if len(lstAliases) != 0:
+        addlist.append(("alias", lstAliases))
+    if len(lstMonitGroup) != 0:
+        addlist.append(("monitgroup", lstMonitGroup))
+    addlist.append(("macAddress", strMACAddress))
+    addlist.append(("ipHostNumber", strIPAddress))
+    addlist.append(("pcNumber", strPCNumber))
+    addlist.append(("location", strLocation))
+    if len(strInfo) != 0:
+        addlist.append(("description", strInfo))
+    addlist.append(("manager", dnManager))
+    if dnConsole != None:
+        addlist.append(("console", dnConsole))
+        add_console_port(ldapDatabase, dnConsole, dn)
+    if dnPowerOutlet != None:
+        addlist.append(("powerplug", dnPowerOutlet))
+        add_power_outlet(ldapDatabase, dnPowerOutlet, dn)
+
+    for option in dhcpInfo.lstDHCPStatements:
+        if option.find(";") != -1:
+            raise  RuntimeError, "Invalid character \";\" in dhcp option \'%s\'" %option
+    try:
+        ldapDatabase.create_ldapObject(dn, addlist)
+        if bDebug:
+            print "Returned from create_ldapObject()"
+            print ("Calling notify_admin\n")
+        if not bNoEmail:
+            notify_admin(strNodeName,"add","")
+    except:
+        print ("create_ldapObject() failed\n")
+        raise sys.exc_type, sys.exc_value
+
+    modlist=[]
+    modlist.append((ldap.MOD_ADD, "objectClass", "puppetClient"))
+    if len(puppetClass.lstPUPPETClasses) != 0:
+        print "Adding Puppet Classes"
+        modlist.append((ldap.MOD_ADD, "puppetClass" , puppetClass.lstPUPPETClasses))
+    ldapDatabase.modify_dn(dn, modlist)
+#    if (len(puppetClass.lstPUPPETClasses) != 0):
+#        print "Adding Puppet Classes"
+#        modlist=[]
+#        modlist.append((ldap.MOD_ADD, "objectClass", "puppetClient"))
+#        if len(puppetClass.lstPUPPETClasses) != 0:
+#            modlist.append((ldap.MOD_ADD, "puppetClass" , puppetClass.lstPUPPETClasses))
+#        ldapDatabase.modify_dn(dn, modlist)
+
+    if (len(dhcpInfo.lstDHCPStatements) != 0) \
+        or (dhcpInfo.iDHCPDefaultLease != None) \
+        or (dhcpInfo.iDHCPMaxLease != None):
+        print "Adding dhcp options"
+        # If the rest of this method fails, we delete the new node
+        try:
+            modlist=[]
+            modlist.append((ldap.MOD_ADD, "objectClass", "dhcpConfigObject"))
+            if len(dhcpInfo.lstDHCPStatements) != 0:
+                modlist.append((ldap.MOD_ADD, "dhcp-statement", dhcpInfo.lstDHCPStatements))
+            if dhcpInfo.iDHCPDefaultLease != None:
+                modlist.append((ldap.MOD_ADD, "dhcp-default-lease-time", str(dhcpInfo.iDHCPDefaultLease)))
+            if dhcpInfo.iDHCPMaxLease != None:
+                modlist.append((ldap.MOD_ADD, "dhcp-max-lease-time", str(dhcpInfo.iDHCPMaxLease)))
+            ldapDatabase.modify_dn(dn, modlist)
+        except:
+            ldapDatabase.delete_ldapObject(dn)
+            raise sys.exc_type, sys.exc_value
+    return 0
+		
+
+# Edit a node in an LDAP database
+# If an argument should not be changed, set it to None or [] for a list
+def edit_node(ldapDatabase, base, strNodeName, strSubnet, lstAliases, lstCnames, strIPAddress, strMACAddress, strNewNodeName, strDeleteAlias, strAddAlias, strDeleteCname, strAddCname, strInfo, dnManager, \
+		dnConsole, dnPowerOutlet, dhcpInfo, puppetClass, strAddPuppetClass, strDeletePuppetClass, strPCNumber, strLocation, strDeleteDhcpopt, \
+        lstMonitGroup, strDeleteMonitGroup, strAddMonitGroup ):
+    # Check that all cnames belong to the same node
+    if bDebug:
+        print "In edit_node\n"
+    dn = find_cname( ldapDatabase, base, strNodeName, None ) 
+    if dn == None:
+        raise "Node %s not found"%strNodeName
+    attr = ldapDatabase.search_s([("objectClass","hostObject")],dn, ldap.SCOPE_BASE)[0][1]
+    # Check to see if we need to change the subnet of the node
+    oldSubnet = dnExtractSubnet( dn )
+    for option in dhcpInfo.lstDHCPStatements:
+        if option.find(";") != -1:
+            raise  RuntimeError, "Invalid character \";\" in dhcp option \'%s\'" %option
+    if strSubnet != None and strSubnet != oldSubnet:
+        # Get relative name
+        parent   = ldapDatabase.get_parent( dn )
+        nodeName = ldapDatabase.get_cn( dn )
+        newRdn   = "cn=%s" % nodeName
+
+        # Get new parent
+        newParent = "dc=%s," % strSubnet + ldapDatabase.get_parent( parent )
+
+        try:
+            # Rename the node into the new subnet
+            ldapDatabase.rename_dn( dn, newRdn, newParent )
+
+            # Get the new dn
+            dn = ldapDatabase.get_hostdn_by_cname( nodeName )
+            assert dn
+
+        except ldap.INVALID_DN_SYNTAX:
+            raise RuntimeError, "invalid rename of %s %s to parent %s!" % ( dn, newRdn, newParent )
+        except ldap.NOT_ALLOWED_ON_NONLEAF:
+            raise RuntimeError, "rename to subnet %s failed!" % strSubnet
+
+    # Check to see if we need to rename the node
+    if strNewNodeName != None:
+        # Get relative name
+        parent   = ldapDatabase.get_parent( dn )
+        subnet = dnExtractSubnet( dn )
+        nodeName = ldapDatabase.get_cn( dn )
+        newRdn   = "cn=%s" % strNewNodeName
+
+        try:
+            # Rename the node into the new subnet
+            ldapDatabase.rename_dn( dn, newRdn )
+
+            # Get the new dn
+            dn = ldapDatabase.get_hostdn_by_cname( strNewNodeName )
+            assert dn
+            if bDebug:
+                print ("Calling notify_admin\n")
+            if not bNoEmail:
+                notify_admin(strNewNodeName,"rename",strNodeName)
+
+        except ldap.INVALID_DN_SYNTAX:
+            raise RuntimeError, "invalid rename of %s %s to parent %s!" % ( dn, newRdn, newParent )
+        except ldap.NOT_ALLOWED_ON_NONLEAF:
+            raise RuntimeError, "rename to subnet %s failed!" % strSubnet
+
+    # Build the LDAP request
+    modlist=[]
+    if bDebug:
+        print "lstCnames: "
+        print lstCnames
+    if len(lstCnames) != 0:
+        if attr.has_key("cname"):
+            modlist.append((ldap.MOD_DELETE, "cname", None))
+        modlist.append((ldap.MOD_ADD, "cname", lstCnames))
+    # If --cname is used, then --add-cname or --delete-cname is not carried out.
+    else:
+        if strAddCname != None:
+            if bDebug:
+                print "strAddCname: " + strAddCname
+            modlist.append((ldap.MOD_ADD, "cname", strAddCname))
+        if strDeleteCname != None:
+            if bDebug:
+                print "strDeleteCname: " + strDeleteCname
+            modlist.append((ldap.MOD_DELETE, "cname", strDeleteCname))
+    if len(lstAliases) != 0:
+        if bDebug:
+            print "lstAliases: " + lstAliases
+        if attr.has_key("alias"):
+            modlist.append((ldap.MOD_DELETE, "alias", None))
+        modlist.append((ldap.MOD_ADD, "alias", lstAliases))
+    # If --alias is used, then --add-alias or --delete-alias is not carried out.
+    else:
+        if strAddAlias != None:
+            if bDebug:
+                print "strAddAlias: " + strAddAlias
+            modlist.append((ldap.MOD_ADD, "alias", strAddAlias))
+        if strDeleteAlias != None:
+            modlist.append((ldap.MOD_DELETE, "alias", strDeleteAlias))
+    if len(lstMonitGroup) != 0:
+        if bDebug:
+            print "lstMonitGroup: " + lstAliases
+        if attr.has_key("monitgroup"):
+            modlist.append((ldap.MOD_DELETE, "monitgroup", None))
+        modlist.append((ldap.MOD_ADD, "monitgroup", lstMonitGroup))
+    # If --monitgroup is used, then --add-monitgroup or --delete-monitgroup is not carried out.
+    else:
+        if strAddMonitGroup != None:
+            if bDebug:
+                print "strAddMonitGroup: " + strAddMonitGroup
+            modlist.append((ldap.MOD_ADD, "monitgroup", strAddMonitGroup))
+        if strDeleteMonitGroup != None:
+            modlist.append((ldap.MOD_DELETE, "monitgroup", strDeleteMonitGroup))
+    if strMACAddress != None:
+        modlist.append((ldap.MOD_REPLACE, "macAddress", strMACAddress))
+    if strIPAddress != None:
+        modlist.append((ldap.MOD_REPLACE, "ipHostNumber", strIPAddress))
+    if strPCNumber != None:
+        modlist.append((ldap.MOD_REPLACE, "pcNumber", strPCNumber))
+    if strLocation != None:
+        modlist.append((ldap.MOD_REPLACE, "location", strLocation))
+    if strInfo != None:
+        if attr.has_key("description"):
+            mode = ldap.MOD_REPLACE
+        else:
+            mode = ldap.MOD_ADD        
+        modlist.append((mode, "description", strInfo))
+    if dnManager != None:
+        modlist.append((ldap.MOD_REPLACE, "manager", dnManager))
+
+    if dnConsole != None:
+        dnNewConsole = None
+        dnOldConsole = None
+        if len(dnConsole) == 0:
+            if dnOldConsole:
+                mode = ldap.MOD_DELETE
+                del_console_port(ldapDatabase,base,dn)
+            else:
+                mode = None
+        else:
+                del_console_port(ldapDatabase,base,dn)
+                add_console_port(ldapDatabase,dnConsole,dn)
+
+    if dnPowerOutlet != None:
+        if len(dnPowerOutlet) == 0:
+            if attr.has_key("powerplug"):
+                modlist.append((ldap.MOD_DELETE, "powerplug", None))
+        else:
+                del_power_outlet(ldapDatabase, base, dn)
+                add_power_outlet(ldapDatabase, dnPowerOutlet, dn)
+
+    if strDeleteDhcpopt != None:
+        mode = ldap.MOD_DELETE
+        print "adding strDeleteDhcpopt to modlist"
+        modlist.append((mode, "dhcp-statement", strDeleteDhcpopt))
+
+    if ( dhcpInfo.isOptionSet( ) ):
+        bAddConfigObject = True
+        for obj in attr["objectClass"]:
+            if obj == "dhcpConfigObject":
+                bAddConfigObject = False
+        if bAddConfigObject:
+            modlist.append((ldap.MOD_ADD, "objectClass", "dhcpConfigObject"))
+        if len(dhcpInfo.lstDHCPStatements) != 0:
+            if not bAddConfigObject:
+                mode = ldap.MOD_DELETE        
+                modlist.append((mode, "dhcp-statement", None))
+            if dhcpInfo.lstDHCPStatements[0] != "None":
+                mode = ldap.MOD_ADD        
+                modlist.append((mode, "dhcp-statement", dhcpInfo.lstDHCPStatements))
+        if dhcpInfo.iDHCPDefaultLease != None:
+            if attr.has_key("dhcp-default-lease-time"):
+                mode = ldap.MOD_REPLACE
+            else:
+                mode = ldap.MOD_ADD        
+            modlist.append((mode, "dhcp-default-lease-time", dhcpInfo.iDHCPDefaultLease))
+        if dhcpInfo.iDHCPMaxLease != None:
+            if attr.has_key("dhcp-max-lease-time"):
+                mode = ldap.MOD_REPLACE
+            else:
+                mode = ldap.MOD_ADD        
+            modlist.append((mode, "dhcp-max-lease-time", dhcpInfo.iDHCPMaxLease))
+
+    if ( puppetClass.isClassSet( ) ):
+        bAddPuppetObject = True
+        for obj in attr["objectClass"]:
+            if obj == "puppetClient":
+                bAddPuppetObject = False
+        if bAddPuppetObject:
+            modlist.append((ldap.MOD_ADD, "objectClass", "puppetClient"))
+        if len(puppetClass.lstPUPPETClasses) != 0:
+            if not bAddPuppetObject:
+                mode = ldap.MOD_DELETE        
+                modlist.append((mode, "puppetClass", None))
+        if puppetClass.lstPUPPETClasses[0] != "None":
+                mode = ldap.MOD_ADD        
+                modlist.append((mode, "puppetClass", puppetClass.lstPUPPETClasses))
+# If --puppetclass option is used, the --add-puppetclass or --delete-puppetclass is redundant.
+    else: 
+        # Still need to check if puppetClient class exists.
+        bAddPuppetObject = True
+        for obj in attr["objectClass"]:
+            if obj == "puppetClient":
+                bAddPuppetObject = False
+        if bAddPuppetObject:
+            modlist.append((ldap.MOD_ADD, "objectClass", "puppetClient"))
+        if strAddPuppetClass != None:
+            modlist.append((ldap.MOD_ADD, "puppetClass", strAddPuppetClass))
+        if strDeletePuppetClass != None:
+            modlist.append((ldap.MOD_DELETE, "puppetClass", strDeletePuppetClass))
+
+    if bDebug:
+        print "Printing dn, modlist"
+        print dn
+        print modlist
+    ldapDatabase.modify_dn(dn, modlist)
+    return 0
+
+def view_node(ldapDatabase, dnBase, strNode, strSubnet=None, brief=False):
+	dn = find_cname(ldapDatabase, dnBase, strNode, strSubnet)
+	if dn == None:
+		if strSubnet == None:
+			raise RuntimeError, "no network node found under name or cname %s" % (strNode)
+		else:
+			raise RuntimeError, "no network node found under name or cname %s in subnet %s" % (strNode, strSubnet)
+	attr = ldapDatabase.get_attributes(dn)
+	if brief:
+		print "%s" % (', '.join(attr["cn"]))
+		return 0
+	# Note: Most fields should never have multiple entries but this tool should be able to see that glitch
+	print "\tname: %s" % (', '.join(attr["cn"]))	
+	# Get the subnet out of the dn
+	strSubnet = dnExtractSubnet( dn )
+	print "\tsubnet: %s" % (strSubnet)
+	if attr.has_key("cname"):
+		print "\tcnames: %s" % (', '.join(attr["cname"]))
+	if attr.has_key("alias"):
+		print "\taliases: %s" % (', '.join(attr["alias"]))
+	if attr.has_key("macAddress"):
+		print "\tEthernet Address: %s" % (', '.join(attr["macAddress"]))
+	if attr.has_key("ipHostNumber"):
+		print "\tIP: %s" % (', '.join(attr["ipHostNumber"]))
+	if attr.has_key("pcNumber"):
+		print "\tPC#: %s" % (', '.join(attr["pcNumber"]))
+	if attr.has_key("location"):
+		print "\tLocation: %s" % (', '.join(attr["location"]))
+	if attr.has_key("manager"):
+		print "\tContact: %s" % (', '.join(attr["manager"]))
+        portdn = ldapDatabase.get_dn_by_attribute([("objectClass","serialPortObject"),("link",dn)],dnBase) 
+        if portdn:
+		print "\tConsole Port DN: %s" %portdn[0]
+        powerdn = ldapDatabase.get_dn_by_attribute([("objectClass","powerOutletObject"),("powerplug",dn)],dnBase) 
+        if powerdn:
+		print "\tPower Outlet DN: %s" %powerdn[0]
+
+	if attr.has_key("description"):
+		print "\tDescription: %s" % (', '.join(attr["description"]))
+	bConfigObject = False
+	for obj in attr["objectClass"]:
+		if obj == "dhcpConfigObject":
+			bConfigObject = True
+	if bConfigObject:
+		print "\tDHCP parameters:"
+		if attr.has_key("dhcp-default-lease-time"):
+			print "\t\tdefault-lease-time " + str(attr["dhcp-default-lease-time"][0]) + ";"
+		if attr.has_key("dhcp-max-lease-time"):
+			print "\t\tmax-lease-time " + str(attr["dhcp-max-lease-time"][0]) + ";"
+		if attr.has_key("dhcp-statement"):
+			for option in attr["dhcp-statement"]:
+				print "\t\t" + option + ";"
+	bConfigObject = False
+	for obj in attr["objectClass"]:
+		if obj == "puppetClient":
+			bConfigObject = True
+	if bConfigObject:
+		print "\tPuppet Classes:"
+		if attr.has_key("puppetClass"):
+			for puppetclass in attr["puppetClass"]:
+				print "\t\t" + puppetclass
+	if attr.has_key("monitgroup"):
+		print "\tMonit Group: %s" % (', '.join(attr["monitgroup"]))
+	return 0
+
+def search_node(ldapDatabase, dnBase, strMatch, strSubnet=None, brief=False):
+	lst_dnattr = find_all(ldapDatabase, dnBase, strMatch, strSubnet)
+	if lst_dnattr == None:
+		print "\nFound 0 entry that match %s." % (iCount, strMatch)
+		return 0
+	iCount = 0
+	for (dn, attr) in lst_dnattr:
+		if brief:
+			print "%s" % (', '.join(attr["cn"]))
+			continue
+		print
+		# Note: Most fields should never have multiple entries but this tool should be able to see that glitch
+		print "%s:" % (', '.join(attr["cn"]))	
+		# Get the subnet out of the dn
+		regex = re.compile("dc=([^,]+)")
+		s = regex.search(dn)
+		if s == None:
+			strSubnet = "???"
+		else:
+			strSubnet = s.expand(r"\1").lower()
+		print "\tsubnet: %s" % (strSubnet)
+		if attr.has_key("cname"):
+			print "\tcnames: %s" % (', '.join(attr["cname"]))
+		if attr.has_key("alias"):
+			print "\taliases: %s" % (', '.join(attr["alias"]))
+		if attr.has_key("macAddress"):
+			print "\tEthernet Address: %s" % (', '.join(attr["macAddress"]))
+		if attr.has_key("ipHostNumber"):
+			print "\tIP: %s" % (', '.join(attr["ipHostNumber"]))
+		if attr.has_key("manager"):
+			print "\tContact: %s" % (', '.join(attr["manager"]))
+		if attr.has_key("console"):
+			for console in attr["console"]:
+				print "\tConsole accessible using %s" % (console)
+				if  dn != get_console(ldapDatabase, dnBase, console):
+					print "\tERROR: terminal server port disagree about the equipment using it:", \
+						get_console(ldapDatabase, dnBase, console)
+		if attr.has_key("powerplug"):
+			for plug in attr["powerplug"]:
+				print "\tPower controlled through %s" % (plug)
+				if  dn != get_outlet(ldapDatabase, dnBase, plug):
+					print "\tERROR: power outlet disagree about the equipment using it:", \
+						get_outlet(ldapDatabase, dnBase, plug)
+		if attr.has_key("pcNumber"):
+			print "\tPC Number: %s" % (', '.join(attr["pcNumber"]))
+		if attr.has_key("location"):
+			print "\tLocation: %s" % (', '.join(attr["location"]))
+		if attr.has_key("description"):
+			print "\tDescription: %s" % (', '.join(attr["description"]))
+		bConfigObject = False
+		for obj in attr["objectClass"]:
+			if obj == "dhcpConfigObject":
+				bConfigObject = True
+		if bConfigObject:
+			print "\tDHCP parameters:"
+			if attr.has_key("dhcp-default-lease-time"):
+				print "\t\tdefault-lease-time " + str(attr["dhcp-default-lease-time"][0]) + ";"
+			if attr.has_key("dhcp-max-lease-time"):
+				print "\t\tmax-lease-time " + str(attr["dhcp-max-lease-time"][0]) + ";"
+			if attr.has_key("dhcp-statement"):
+				for option in attr["dhcp-statement"]:
+					print "\t\t" + option + ";"
+		bConfigObject = False
+		for obj in attr["objectClass"]:
+			if obj == "puppetClient":
+				bConfigObject = True
+		if bConfigObject:
+			print "\tPuppet Classes:"
+			if attr.has_key("puppetClass"):
+				for puppetclass in attr["puppetClass"]:
+					print "\t\t" + puppetclass
+		iCount += 1
+	if not brief:
+		print "\nFound %d entries that match %s." % (iCount, strMatch)
+	return 0
+
+class DHCPInfo:
+	def __init__( self ):
+		self.lstDHCPOptions=[]
+		self.lstDHCPStatements=[]
+		self.iDHCPDefaultLease=None
+		self.iDHCPMaxLease=None
+		self._optionSet=False
+
+	def isOptionSet( self ):
+		return self._optionSet
+
+	def addOption( self, option ):
+		self.lstDHCPOptions.append( option )
+		self._optionSet = True
+
+	def setLease( self, lease ):
+		self.iDHCPDefaultLease = lease
+		self._optionSet = True
+
+	def setMaxLease( self, lease ):
+		self.iDHCPMaxLease= maxLease
+		self._optionSet = True
+
+	def addStatement( self, statement ):
+		self.lstDHCPStatements.append( statement )
+		self._optionSet = True
+
+class PUPPETClass:
+	def __init__( self ):
+		self.lstPUPPETClasses=[]
+		self._optionSet=False
+
+	def isClassSet( self ):
+		return self._optionSet
+
+	def addClass( self, puppetclass ):
+		self.lstPUPPETClasses.append ( puppetclass )
+		self._optionSet = True
+
+def getNetworkIPAddress( ldapDatabase, dnBase, strSubnet ):
+	(strIP, strNetMask) = get_subnet(ldapDatabase, dnBase, strSubnet)
+	if (strIP == None) or (strNetMask == None):
+		raise RuntimeError, "could not get subnet %s IP" % (strSubnet)
+	ip = [int(c) for c in strIP.split('.')]
+	netmask = [int(c) for c in strNetMask.split('.')]
+	if (len(ip) != 4) or (len(netmask) != 4):
+		raise RuntimeError, "subnet %s IP %s is invalid" % (strSubnet, strIP)
+	# The first 20 IPs are reserved by SCCS
+	ipaddr = [ ip[0] & netmask[0], ip[1] & netmask[1], ip[2] & netmask[2], (ip[3] & netmask[3]) + 21]
+	while True:
+		strIPAddress = ".".join([str(ipaddr[i]) for i in range(4)])
+		if find_ipaddr(ldapDatabase, dnBase, strIPAddress) == None:
+			break
+		for i in range(3, -2, -1):
+			if i == -1:
+				raise RuntimeError, "No more IP available on subnet %s" % (strSubnet)
+			ipaddr[i] += 1
+			if i != 3:
+				if ipaddr[i] <= ip[i] + (255-netmask[i]):
+					break
+				ipaddr[i] = ip[i] & netmask[i]
+			else:
+				# In this case we have to exclude the broadcast address
+				if ipaddr[i] <= ip[i] + (255-netmask[i])-1:
+					break
+				ipaddr[i] = (ip[i] & netmask[i]) + 21
+	return strIPAddress
+
+# Main
+def main():
+    global bDebug
+    global bNoEmail
+
+	# Set the defaults for all command line arguments
+    bModeSet=False		# Just in case someone would name a node add, remove or modify
+				# we detect when the option has been set
+    bNewNode=False
+    bDelNode=False
+    bChangeNode=False
+    bViewNode=False
+    bSearchNode=False
+    bDebug=False
+    bNoEmail=False
+    bRestartServices=True
+    lstNodeAliases=[]		# This variable is a list of alias for --add and --modify, 
+    lstNodeCnames=[]		# This variable is a list of cname for --add and --modify, 
+    lstNodeMonitGroup=[]		# This variable is a list of monit groups for --add and --modify, 
+				# but a list of nodes for --remove
+    dhcpInfo = DHCPInfo()
+    puppetClass = PUPPETClass()
+    strMacAddress=None
+    strManager=None
+    strInfo=None
+    strSubnet=None
+    bInteractive=True
+    bBriefView=False
+    strConsole = None
+    strPowerOutlet = None
+    strIPAddress = None
+    strPCNumber = None
+    strLocation = None
+    strNewNodeName = None
+    strAddMonitGroup = None
+    strDeleteMonitGroup = None
+    strAddAlias = None
+    strDeleteAlias = None
+    strAddCname = None
+    strDeleteCname = None
+    strAddPuppetClass = None
+    strDeletePuppetClass = None
+    strDeleteDhcpopt = None
+	# Parse the command line
+    index=1
+    while index < len(sys.argv):
+        if sys.argv[index] == '--help' or sys.argv[index] == '-h':
+            usage()
+            return 0
+        elif (sys.argv[index] == 'view') and (not bModeSet):
+            bModeSet=True
+            bViewNode=True
+        elif (sys.argv[index] == 'search') and (not bModeSet):
+            bModeSet=True
+            bSearchNode=True
+        elif (sys.argv[index] == 'add') and (not bModeSet):
+            bModeSet=True
+            bNewNode=True
+        elif (sys.argv[index] == 'edit') and (not bModeSet):
+            bModeSet=True
+            bChangeNode=True
+        elif (sys.argv[index] == 'del') and (not bModeSet):
+            bModeSet=True
+            bDelNode=True
+        elif sys.argv[index] == '--mac':
+            index+=1
+            strMacAddress=sys.argv[index]
+        elif sys.argv[index] == '--ip':
+            index+=1
+            strIPAddress=sys.argv[index]
+        elif sys.argv[index] == '--pc':
+            index+=1
+            strPCNumber=sys.argv[index]
+        elif sys.argv[index] == '--location':
+            index+=1
+            strLocation=sys.argv[index]
+        elif sys.argv[index] == '--dhcp-default-lease':
+            index+=1
+            dhcpInfo.setLease( int(sys.argv[index]) )
+        elif sys.argv[index] == '--dhcp-max-lease':
+            index+=1
+            dhcpInfo.setMaxLease( int(sys.argv[index] ) )
+        elif sys.argv[index] == '--dhcpopt':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "DHCP statement cannot starts with \"-\""
+            dhcpInfo.addStatement( sys.argv[index] )
+        elif sys.argv[index] == '--delete-dhcpopt':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "DHCP statement cannot starts with \"-\""
+            strDeleteDhcpopt=sys.argv[index]
+        elif sys.argv[index] == '--puppetclass':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "Puppet Class cannot starts with \"-\""
+            puppetClass.addClass( sys.argv[index] )
+        elif sys.argv[index] == '--add-puppetclass':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "Puppet Class cannot starts with \"-\""
+            strAddPuppetClass=sys.argv[index]
+        elif sys.argv[index] == '--delete-puppetclass':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "Puppet Class cannot starts with \"-\""
+            strDeletePuppetClass=sys.argv[index]
+        elif sys.argv[index] == '--manager':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "manager cannot starts with \"-\""
+            strManager=sys.argv[index]
+        elif sys.argv[index] == '--info':
+            index+=1
+            strInfo=sys.argv[index]
+        elif sys.argv[index] == '--subnet':
+            index+=1
+            strSubnet=sys.argv[index]
+        elif sys.argv[index] == '--noask':
+            bInteractive=False
+        elif sys.argv[index] == '--noprompt':
+            bInteractive=False
+        elif sys.argv[index] == '--batch':
+			bInteractive=False
+        elif sys.argv[index] == '--brief':
+            bBriefView=True
+        elif sys.argv[index] == '--console':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "console name cannot starts with \"-\""
+            strConsole=sys.argv[index]
+        elif sys.argv[index] == '--power':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "power controller name cannot starts with \"-\""
+            strPowerOutlet=sys.argv[index]
+        elif sys.argv[index] == '--new-node-name':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "nodename cannot starts with \"-\""
+            strNewNodeName=sys.argv[index].lower()
+        elif sys.argv[index] == '--alias':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "alias cannot starts with \"-\""
+            lstNodeAliases.append(sys.argv[index])
+        elif sys.argv[index] == '--delete-alias':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "alias cannot starts with \"-\""
+            strDeleteAlias=sys.argv[index]
+        elif sys.argv[index] == '--add-alias':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "alias cannot starts with \"-\""
+            strAddAlias=sys.argv[index]
+        elif sys.argv[index] == '--cname':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "cname cannot starts with \"-\""
+            lstNodeCnames.append(sys.argv[index].lower())
+        elif sys.argv[index] == '--delete-cname':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "cname cannot starts with \"-\""
+            strDeleteCname=sys.argv[index]
+        elif sys.argv[index] == '--add-cname':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "cname cannot starts with \"-\""
+            strAddCname=sys.argv[index].lower()
+        elif sys.argv[index] == '--monitgroup':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "monitgroup cannot starts with \"-\""
+            lstNodeMonitGroup.append(sys.argv[index])
+        elif sys.argv[index] == '--delete-monitgroup':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "monitgroup cannot starts with \"-\""
+            strDeleteMonitGroup=sys.argv[index]
+        elif sys.argv[index] == '--add-monitgroup':
+            index+=1
+            if sys.argv[index].startswith('-'):
+                raise RuntimeError, "monitgroup cannot starts with \"-\""
+            strAddMonitGroup=sys.argv[index].lower()
+        elif sys.argv[index] == '--debug':
+            bDebug=True
+        elif sys.argv[index] == '--noemail':
+            bNoEmail=True
+        elif sys.argv[index] == '--norestart':
+            bRestartServices=False
+        elif index == 2:
+            lstNodeCnames.append(sys.argv[index].lower())
+        else:
+            raise  RuntimeError, "Invalid argument %s in non-interactive mode. Try --help"%sys.argv[index]
+        index+=1
+
+	# Check command line arguments
+    if not bModeSet:
+        raise RuntimeError, "missing argument view, add, edit or del. Try --help"
+    if bDelNode and (len(lstNodeCnames) == 0):
+        raise RuntimeError, "no nodes to delete. Try --help"
+    elif bChangeNode and (len(lstNodeCnames) == 0):
+        raise RuntimeError, "no node to modify. Try --help"
+    elif bNewNode and (not bInteractive):
+		# In this case all info must be on the command line
+        if strSubnet == None:
+            raise RuntimeError, "Missing argument in non-interactive mode: Subnet. Try --help"
+        if strMacAddress == None:
+            raise RuntimeError, "Missing argument in non-interactive mode: MAC address. Try --help"
+        if strManager == None:
+            raise RuntimeError, "Missing argument in non-interactive mode: Manager. Try --help"
+        if len(lstNodeCnames) == 0:
+            raise RuntimeError, "Missing argument in non-interactive mode: Host name. Try --help"
+    if strMacAddress != None:
+        if check_etheraddr(strMacAddress) < 0:
+            raise RuntimeError, "invalid MAC address %s" % (strMacAddress)
+    if strSubnet != None:
+        strSubnet = strSubnet.lower()
+
+	# Get the base dn from openldap
+	#try:
+	#	configfile=open("/etc/openldap/ldap.conf")
+	#	regexBase = re.compile("^BASE\s+(.*)$")
+	#	regexHost = re.compile("^HOST\s+(.*)$")
+	#	for line in configfile.xreadlines():
+	#		find = regexBase.search(line)
+	#		if find != None:
+	#			dnBase=find.expand(r"\1")
+	#		else:
+	#			find = regexHost.search(line)
+	#			if find != None:
+	#				ldap_server=find.expand(r"\1")
+	#	configfile.close()
+	#	if dnBase == None or ldap_server == None:
+	#		raise RuntimeError, "no BASE or HOST statement in LDAP config file"
+	#except:
+	#	print "ERROR reading /etc/openldap/ldap.conf: %s." % (sys.exc_value)
+	#	if bDebug:
+	#		traceback.print_tb(sys.exc_traceback)
+	#	return 10
+
+	# First we connect to the database anonymously for parameters checking and view mode
+    try:
+        #ldapdb_url=ldapurl.LDAPUrl(hostport=ldap_server, dn=dnBase)
+        #ldapdb=ldap.initialize(ldapdb_url.unparse())
+        #ldapdb.simple_bind_s()
+        #print "Connecting anonymously to server ..."
+        ldapDatabase = pyslac.ldapAccess.ldapAccess()
+        base = ldapDatabase.get_dnbase()
+        dnBase = base
+
+        labrootdn = ldapDatabase.get_dn_by_attribute( [("objectClass","labeledURIObject")], "ou=labroot," + base)[0]
+        labrootobj = pyslac.ldapAccess.ldapObject(ldapDatabase, labrootdn)
+        labroot = labrootobj.get_attr("labeledURI")[0]
+
+
+    except:
+        print "ERROR connecting to the LDAP database: %s." % (sys.exc_value)
+        if bDebug:
+            traceback.print_tb(sys.exc_traceback)
+        return 20
+
+    # View and Search modes are a special case: we do not need special rights
+    # We bypass the remaining of the script
+    if bViewNode:
+        if strSubnet != None:
+            if check_subnet(ldapDatabase, dnBase, strSubnet) < 0:
+                raise RuntimeError, "invalid subnet %s" % (strSubnet)
+        for node in lstNodeCnames:
+            try:
+                view_node(ldapDatabase, dnBase, node, strSubnet, brief=bBriefView)
+            except:
+                print "\n%s: not found in LDAP directory." % (node)
+    #	ldapdb.unbind()
+        return 0
+    if bSearchNode:
+        if strSubnet != None:
+            if check_subnet(ldapDatabase, dnBase, strSubnet) < 0:
+                raise RuntimeError, "invalid subnet %s" % (strSubnet)
+        for strSearch in lstNodeCnames:
+            try:
+                search_node(ldapDatabase, dnBase, strSearch, strSubnet, brief=bBriefView)
+            except:
+                print "\n%s: not found in LDAP directory." % (node)
+    #	ldapdb.unbind()
+        return 0
+
+    # Make sure this script can run (ie we can
+    # talk to the LDAP database as ldap-update)
+    try:
+        keyname = glob.glob(labroot + "/sshkeys/" + LDAP_KEY_FILE)[0]
+        keyfile = open(keyname, "r")
+        ldap_key = keyfile.read()
+        keyfile.close()
+    except:
+        print "You are not allowed to read the LDAP access key %s on this host" %(keyname)
+        return 25
+
+    # Ask for the missing information
+    if bInteractive and bNewNode:
+        print "\nAdding a new node (press Ctrl-C to cancel):"
+        while strSubnet == None:
+            print "List of available subnets:"
+            lstSubnets = list_subnet(ldapDatabase, dnBase)
+            for subnet in sorted(lstSubnets):
+                print "\t" + subnet
+            strSubnet = raw_input("Subnet: ")
+            strSubnet.lower()
+            if check_subnet(ldapDatabase, dnBase, strSubnet) < 0:
+                print "Invalid subnet %s, try again.\n" % (strSubnet)
+                strSubnet = None
+        if len(lstNodeCnames) == 0:
+            while len(lstNodeCnames) == 0:
+                lstNodeCnames = raw_input("Name: ").split()
+        if len(lstNodeCnames) == 1:
+            lstNodeCnames.extend(raw_input("DNS cnames (separated by spaces): ").split())
+        if len(lstNodeAliases) == 0:
+            lstNodeAliases.extend(raw_input("Non-DNS Aliases (separated by spaces): ").split())
+        if len(lstNodeMonitGroup) == 0:
+            lstNodeMonitGroup.extend(raw_input("Monit groups (separated by spaces): ").split())
+        while strPCNumber == None:
+            strPCNumber = raw_input("PC# (enter only the numeric number):")
+            if len(strPCNumber) == 0:
+                strPCNumber = None	
+                print "Please enter the PC#, 00000 if unavailable now. However please look it up and enter asap."
+        while strLocation == None:
+            strLocation = raw_input("Location:")
+            if len(strLocation) == 0:
+                strLocation = None	
+                print "Please enter the physical location (format should be 'building,room,comment' or 'building,room,rack,elevation'):"
+        while strMacAddress == None:
+            strMacAddress = raw_input("Node MAC address: ")
+            if check_etheraddr(strMacAddress) < 0:
+                print "Invalid MAC address %s, try again.\n" % (strMacAddress)
+                strMacAddress = None
+        while strManager == None:
+            strManager = raw_input("User in charge of this node: ")
+        while strConsole == None:
+            strConsole = raw_input("Terminal server to which the console is connected (<host>:<port#>, leave blank if unapplicable): ")
+        while strPowerOutlet == None:
+            strPowerOutlet = raw_input("Controllable power outlet this host is connected to (<host>:<port#>, leave blank if unapplicable): ")
+        if strInfo == None:
+            strInfo = raw_input("Description of the node: ")
+        if not puppetClass.isClassSet():
+            if raw_input("Do you want to specify any PUPPET Class for this node (y/N) ? ").lower() == "y":
+                print "Type in any extra PUPPET Class (an empty line will stop the input):"
+                while True:
+                    strInput = raw_input("\t")
+                    if len(strInput) == 0:
+                        break
+                    puppetClass.addClass(strInput)
+        if not dhcpInfo.isOptionSet():
+            if raw_input("Do you want to specify DHCP parameters for this node (y/N) ? ").lower() == "y":
+                print "Type in any extra DHCP statements (an empty line will stop the input):"
+                while True:
+                    strInput = raw_input("\t")
+                    if len(strInput) == 0:
+                        break
+                    dhcpInfo.addStatement(strInput)
+                while True:
+                    strInput = raw_input("DHCP default lease time (leave blank to use default): ")
+                    if len(strInput) == 0:
+                        break
+                    if strInput.isdigit():
+                        dhcpInfo.setLease( int(strInput) )
+                        break
+                    print "Invalid number %s, try again.\n" % (strInput)
+                while True:
+                    strInput = raw_input("DHCP maximum lease time (leave blank to use default): ")
+                    if len(strInput) == 0:
+                        break
+                    if strInput.isdigit():
+                        dhcpInfo.setMaxLease( int(strInput) )
+                        break
+                    print "Invalid number %s, try again.\n" % (strInput)
+	
+	# Check the subnet, the hostname and possibly assign an IP address
+    print "Checking parameters against LDAP database ... \n",
+    try:
+		# Now we check the subnet parameters
+		# we did not check it earlier because it requires a connection to the LDAP database	
+        if strSubnet != None:
+            if check_subnet(ldapDatabase, dnBase, strSubnet) < 0:
+                raise RuntimeError, "invalid subnet %s" % (strSubnet)
+		# Make sure the MAC address is not already in database
+        if (strMacAddress != None) and (strMacAddress != "00:00:00:00:00:00"):
+		#if strMacAddress != None:
+            dn = find_ethaddr(ldapDatabase, dnBase, strMacAddress)
+            if dn != None:
+                raise RuntimeError, "MAC address %s already registered under %s" % (strMacAddress,dn)
+		# Get the DN of the manager
+        if strManager != None:
+            dnManager = find_user(ldapDatabase, dnBase, strManager)
+            if dnManager == None:
+                raise RuntimeError, "user %s not found in database" % (strManager)
+        else:
+            dnManager = None
+        if strConsole != None:
+            if len(strConsole) != 0:
+                dnConsole = find_terminal(ldapDatabase, dnBase, strConsole)
+                if dnConsole == None:
+                    raise RuntimeError, "terminal server port %s not found in database" % (strConsole)
+                if bNewNode:
+                    dn = get_console(ldapDatabase, dnBase, dnConsole) 
+                    if dn != None:
+                        print "\nWARNING: Terminal server port %s used by %s." % (strConsole, dn)
+                        if bInteractive:
+                            if raw_input("Are you sure you want to change it (y/N) ? ").lower() != "y":
+                                raise RuntimeError, "terminal server port %s already in use by %s" % (strConsole, dn)
+            elif bNewNode:
+                dnConsole = None
+            else:
+                dnConsole = ""
+        else:
+            dnConsole = None
+        if strPowerOutlet != None:
+            if len(strPowerOutlet) != 0:
+                dnPowerOutlet = find_outlet(ldapDatabase, dnBase, strPowerOutlet)
+                if dnPowerOutlet == None:
+                    raise RuntimeError, "power outlet %s not found in database" % (strPowerOutlet)
+                if bNewNode:
+                    dn = get_outlet(ldapDatabase, dnBase, dnPowerOutlet) 
+                    if dn != None:
+                        print "\nWARNING: Power outlet %s used by %s." % (strPowerOutlet, dn)
+                        if bInteractive:
+                            if raw_input("Are you sure you want to change it (y/N) ? ").lower() != "y":
+                                raise RuntimeError, "power outlet %s already in use by %s" % (strPowerOutlet, dn)				
+            elif bNewNode:
+                dnPowerOutlet = None
+            else:
+                dnPowerOutlet = ""
+        else:
+            dnPowerOutlet = None
+        if bDelNode:
+            # Check that all nodes exist
+            for node in lstNodeCnames:
+                if find_cname(ldapDatabase, dnBase, node, strSubnet) == None:
+                    raise RuntimeError, "node %s does not exist" % (node)
+        elif bChangeNode:
+            if anyDuplicate(lstNodeCnames):
+                raise RuntimeError, "Hostname and cnames are case insensitive.\n One of the cnames and hostname have been found to be the same."
+            # Check that all cname belong to the same node
+            dn=None
+            for name in lstNodeCnames:
+                if not isValidHostname(name):
+                    raise RuntimeError, "%s contains character(s) not allowed for hostname." % (name)
+                cname_dn = find_cname( ldapDatabase, dnBase, name, None )
+                if cname_dn == None:
+                    continue
+                elif dn == None:
+                    dn = cname_dn
+                    attr = ldapDatabase.search_s([("objectClass","hostObject")],dn,ldap.SCOPE_BASE)[0][1]
+                    strNodeName = attr["cn"][0]
+                elif dn != cname_dn:
+                    raise RuntimeError, "cname %s does not belong to node %s" % (name, strNodeName)
+            if dn == None:
+                raise RuntimeError, "no node found named %s" % (', '.join(lstNodeCnames))
+            if strAddCname is not None:
+                if not isValidHostname(strAddCname):
+                    raise RuntimeError, "%s contains character(s) not allowed for cname." % (name)
+                cname_dn = find_cname(ldapDatabase, dnBase, strAddCname, None) 
+                if cname_dn != None:
+                    raise RuntimeError, "A node named %s already exists: %s\n Hostname or cname has to be unique across all subnets." % (strAddCname, cname_dn)
+ 
+            newdn = find_cname(ldapDatabase, dnBase, strNewNodeName, None)
+            if newdn != None:
+                raise RuntimeError, "The new name %s already exists: %s\n Hostname or alias has to be unique across all subnets." % (name, newdn)
+            if lstNodeCnames.count(strNodeName) != 0:
+                lstNodeCnames.remove(strNodeName)
+            elif len(lstNodeCnames) == 1:
+                # User only specified the alias name to select the node, not to change all the aliases
+                lstNodeCnames.pop(0)
+            if  strSubnet and strIPAddress == None:
+                # Get a new network IP
+                strIPAddress = getNetworkIPAddress( ldapDatabase, dnBase, strSubnet )
+            if strSubnet == None:
+                strSubnet = dnExtractSubnet (dn)
+
+
+
+        elif bNewNode:
+			# Check that all cnames are not taken and
+			# assign the first cnames as the host name
+            if anyDuplicate(lstNodeCnames):
+                raise RuntimeError, "Hostname and cnames are case incensitive.\n One of the cnames and hostname have been found to be the same."
+            for name in lstNodeCnames:
+                if not isValidHostname(name):
+                    raise RuntimeError, "%s contains character(s) not allowed for hostname." % (name)
+                dn = find_cname(ldapDatabase, dnBase, name, None) 
+                if dn != None:
+                    raise RuntimeError, "A node named %s already exists: %s\n Hostname or cname has to be unique across all subnets." % (name, dn)
+            strNodeName = lstNodeCnames.pop(0)
+			# We get the network IP
+            if  strIPAddress == None:
+                strIPAddress = getNetworkIPAddress( ldapDatabase, dnBase, strSubnet )
+
+        if strIPAddress != None:
+			# Check if the IP is free
+            if find_ipaddr(ldapDatabase, dnBase, strIPAddress) != None:
+                raise RuntimeError, "IP address already taken: %s" % (strIPAddress)
+			# And make sure the IP belong to the right subnet
+            else:
+                (strNetIP, strNetMask) = get_subnet(ldapDatabase, dnBase, strSubnet)
+                if (strNetIP == None) or (strNetMask == None):
+                    raise RuntimeError, "could not get subnet %s IP" % (strSubnet)
+                netip   = [int(c) for c in strNetIP.split('.')]
+                ipaddr  = [int(c) for c in strIPAddress.split('.')]
+                netmask = [int(c) for c in strNetMask.split('.')]
+                for i in range(4):
+                    if (ipaddr[i] & netmask[i]) != netip[i]:
+                        raise RuntimeError, "IP address %s cannot belong to subnet %s" % (strIPAddress, strSubnet)
+    except:
+        print "failed:\nERROR (line %d): %s" % (traceback.tb_lineno(sys.exc_traceback), sys.exc_value)
+        if bDebug:
+            traceback.print_tb(sys.exc_traceback)
+        return 25
+
+	# Confirm the host information
+    if bInteractive:
+        print "\nPlease confirm the following operation:"
+        if bNewNode or bChangeNode:
+            if bNewNode:
+                print "Add a new node on subnet", strSubnet, "with the following attributes:"
+                print "\tName:", strNodeName
+            else:
+                print "Modify", strNodeName, "properties:"
+                if strSubnet != None:
+                    print "\tSubnet:", strSubnet
+            if len(lstNodeAliases) != 0:
+                print "\tAliases:", ', '.join(lstNodeAliases)
+            if len(lstNodeCnames) != 0:
+                print "\tCnames:", ', '.join(lstNodeCnames)
+            if strMacAddress != None:
+                print "\tMAC address:", strMacAddress
+            if strIPAddress != None:
+                print "\tIP address:", strIPAddress
+            if strPCNumber != None:
+                print "\tPC#:", strPCNumber
+            if strLocation != None:
+                print "\tLocation:", strLocation
+            if strNewNodeName != None:
+                print "\tNew hostname name:", strNewNodeName
+            if strAddAlias != None:
+                print "\tAdding alias:", strAddAlias
+            if strDeleteAlias != None:
+                print "\tDeleting alias:", strDeleteAlias
+            if strAddCname != None:
+                print "\tAdding cname:", strAddCname
+            if strDeleteCname != None:
+                print "\tDeleting cname:", strDeleteCname
+            if len(lstNodeAliases) != 0:
+                print "\tMonit Group:", ', '.join(lstNodeMonitGroup)
+            if strAddMonitGroup != None:
+                print "\tAdding monit group:", strAddMonitGroup
+            if strDeleteMonitGroup != None:
+                print "\tDeleting monit group:", strDeleteMonitGroup
+            if strManager != None:
+                print "\tContact:", strManager
+            if dnConsole != None:
+                print "\tConsole connected to", dnConsole
+            if dnPowerOutlet != None:
+                print "\tPower controlled by", dnPowerOutlet
+            if strInfo != None:
+                print "\tDescription:", strInfo
+            if (len(puppetClass.lstPUPPETClasses) != 0):
+                print "\tPuppet Classs:"
+                for puppetclass in puppetClass.lstPUPPETClasses:
+                    if puppetclass.find(";") != -1:
+                        raise  RuntimeError, "Invalid character \";\" in Puppet Class \'%s\'" %puppetclass
+                    print "\t\t" + puppetclass
+            if strAddPuppetClass != None:
+                print "\tAdding Puppet Class:", strAddPuppetClass
+            if strDeletePuppetClass != None:
+                print "\tDeleting Puppet Class:", strDeletePuppetClass
+            if strDeleteDhcpopt != None:
+                print "\tDeleting DHCP Statement:", strDeleteDhcpopt
+            if (len(dhcpInfo.lstDHCPStatements) != 0) \
+                or (dhcpInfo.iDHCPDefaultLease != None) \
+                or (dhcpInfo.iDHCPMaxLease != None):
+                print "\tDHCP parameters:"
+                if dhcpInfo.iDHCPDefaultLease != None:
+                    print "\t\tdefault-lease-time " + str(dhcpInfo.iDHCPDefaultLease) + ";"
+                if dhcpInfo.iDHCPMaxLease != None:
+                    print "\t\tmax-lease-time " + str(dhcpInfo.iDHCPMaxLease) + ";"
+                for option in dhcpInfo.lstDHCPStatements:
+                    if option.find(";") != -1:
+                        raise  RuntimeError, "Invalid character \";\" in dhcp option \'%s\'" %option
+                    print "\t\t" + option + ";"
+        elif bDelNode:
+            print "Remove the following node(s):", ', '.join(lstNodeCnames)
+        print
+        if raw_input("Do you really want to apply those changes (y/N) ? ").lower() != "y":
+            print "Operation canceled."
+            return 30
+	
+	# Connect to the LDAP database
+	# print "Connecting to the LDAP database "
+    try:
+        auth_token = ldap.sasl.digest_md5( LDAP_USER, ldap_key )
+        ldapDatabase = pyslac.ldapAccess.ldapAccess( who="", auth=auth_token )
+    except:
+        print "failed:\nERROR (line %d): %s" % (traceback.tb_lineno(sys.exc_traceback), sys.exc_value)
+        if bDebug:
+            traceback.print_tb(sys.exc_traceback)
+        return 40
+		
+	# Now do the work: check if config is valid and update database
+    print "Updating database ...\n",
+    sSuggestion = None
+    try:
+		# If we are deleting a node we must check that the host exists
+        if bDelNode:
+            sSuggestion	=	"If you are trying to delete a port server, try deltermsrv first.\n"\
+                            "If you are trying to delete a powerstrip,  try delpowerstrip first.\n"
+
+            if strSubnet == None:
+                strNodeName = lstNodeCnames[0]
+                nodedn = ldapDatabase.get_dn_by_attribute([("cn",strNodeName),("objectClass","hostObject")],dnBase)[0]
+                strSubnet =  nodedn.split(",")[1]
+                strSubnet = strSubnet.split("=")[1]
+            for name in lstNodeCnames:
+                del_node(ldapDatabase, dnBase, name, strSubnet)
+                print "\nDeleted node", name, "from LDAP directory."
+        elif bNewNode:
+            add_node(ldapDatabase, dnBase, strNodeName, strSubnet, lstNodeAliases, lstNodeCnames, strIPAddress, strMacAddress, strInfo, dnManager, \
+                    dnConsole, dnPowerOutlet, dhcpInfo, puppetClass, strPCNumber, strLocation, lstNodeMonitGroup )
+			# Sleep for a few seconds to avoid timing issue, ie. ldap slave not getting updated in time.
+            print "Sleeping for 2  seconds to avoid LDAP slave update issue"
+            time.sleep(2)
+            print "\nAdded node " + find_cname(ldapDatabase, dnBase, strNodeName, strSubnet) + " to LDAP directory."
+        elif bChangeNode:
+            edit_node(ldapDatabase, dnBase, strNodeName, strSubnet, lstNodeAliases, lstNodeCnames, strIPAddress, strMacAddress, strNewNodeName, strDeleteAlias, strAddAlias, strDeleteCname, strAddCname, strInfo, dnManager, \
+                    dnConsole, dnPowerOutlet, dhcpInfo, puppetClass, strAddPuppetClass, strDeletePuppetClass, strPCNumber, strLocation, strDeleteDhcpopt, \
+                    lstNodeMonitGroup, strDeleteMonitGroup, strAddMonitGroup )
+            if strNewNodeName != None:
+                strNodeName = strNewNodeName
+            # Sleep for a few seconds to avoid timing issue, ie. ldap slave not getting updated in time.
+            if bRestartServices:
+                print "Sleeping for 2 seconds to avoid LDAP slave update issue"
+                time.sleep(2)
+            print "\nEdited node " + find_cname(ldapDatabase, dnBase, strNodeName, strSubnet) + " in LDAP directory."
+    except:
+        print "failed:\nERROR: %s." % (sys.exc_value)
+        if bDebug:
+            traceback.print_tb(sys.exc_traceback)
+        if sSuggestion:
+            print sSuggestion
+        return 50
+	# Close connection to the LDAP database
+#	ldapdb.unbind()
+	
+    if bRestartServices:
+		# Notify the network services that the LDAP
+		# configuration has changed, call updatenetconfig.
+        print "\nNotify network services that the configuration has changed:"
+        try:
+            os.system(r"$(dirname " + sys.argv[0] + ")/updatenetconfig" + " --strSubnet " + strSubnet )
+        except:
+            print "ERROR: the network services could not restart with the new", sys.exc_info()[0]
+            print "configuration, they will continue running with the old one"
+            return 60
+	
+	# Done
+    return 0
+
+
+# Start of the script, call main()
+retcode=0
+try:
+    retcode=main()
+except KeyboardInterrupt:
+    retcode=100
+    print "\nERROR: interrupted by user."
+except:
+    retcode=101
+    print "ERROR: %s." % (sys.exc_value)
+print ""
+sys.exit(retcode)
+
