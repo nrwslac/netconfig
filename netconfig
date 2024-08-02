@@ -1262,7 +1262,7 @@ def main():
     if bInteractive and bNewNode:
         print "\nAdding a new node (press Ctrl-C to cancel):"
         while strSubnet == None:
-            print "List of available subnets: and TEST local"
+            print "List of available subnets:"
             lstSubnets = list_subnet(ldapDatabase, dnBase)
             for subnet in sorted(lstSubnets):
                 print "\t" + subnet
