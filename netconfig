@@ -1262,7 +1262,7 @@ def main():
     if bInteractive and bNewNode:
         print "\nAdding a new node (press Ctrl-C to cancel):"
         while strSubnet == None:
-            print "List of available subnets:"
+            print "List of available subnets: and TEST local"
             lstSubnets = list_subnet(ldapDatabase, dnBase)
             for subnet in sorted(lstSubnets):
                 print "\t" + subnet
@@ -1297,6 +1297,9 @@ def main():
                 strMacAddress = None
         while strManager == None:
             strManager = raw_input("User in charge of this node: ")
+            if len(strManager) == 0:
+                strManager = None	
+                print "User in charge of this node required."
         while strConsole == None:
             strConsole = raw_input("Terminal server to which the console is connected (<host>:<port#>, leave blank if unapplicable): ")
         while strPowerOutlet == None:
